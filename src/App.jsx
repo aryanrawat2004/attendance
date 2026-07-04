@@ -97,8 +97,21 @@ function StatCard({ icon, label, value, color, sub }) {
 // ─── MAIN COMPONENT ──────────────────────────────────────────────
 export default function AttendanceDashboard() {
   const [tab, setTab]             = useState("today"); // "today" | "monthly" | "payroll"
+  const [clients, setClients]     = useState([]);
+  const [client, setClient]       = useState(""); // Dynamic DeviceId
   const [todayData, setTodayData] = useState([]);
   const [employees, setEmployees] = useState([]);
+
+  function handleClientChange(newClient) {
+    setClient(newClient);
+    setSelEmp(null);
+    setActiveModal(null);
+    setEmployees([]);
+    setTodayData([]);
+    setWeeklyData([]);
+    setPayrollData([]);
+    setMonthly([]);
+  }
   const [weeklyData, setWeeklyData] = useState([]);
   const [monthly, setMonthly]     = useState([]);
   const [payrollData, setPayrollData] = useState([]);
@@ -146,17 +159,30 @@ export default function AttendanceDashboard() {
   const [profileSaveMsg, setProfileSaveMsg]         = useState(null);
 
   useEffect(() => {
-    loadEmployees();
-    loadDaily(selectedDate);
-    loadWeekly();
-    loadPayroll(month, year);
+    fetch(`${API}/clients`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.success && d.data.length > 0) {
+          setClients(d.data);
+          setClient(d.data[0].id);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!client) return;
+    loadEmployees(client);
+    loadDaily(selectedDate, client);
+    loadWeekly(selectedDate, client);
+    loadPayroll(month, year, client);
 
     // Live Auto-Refresh every 30 seconds for biometric machine sync
     const timer = setInterval(() => {
-      loadDaily(selectedDate);
+      loadDaily(selectedDate, client);
     }, 30000);
     return () => clearInterval(timer);
-  }, [selectedDate]);
+  }, [selectedDate, client]);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -171,52 +197,68 @@ export default function AttendanceDashboard() {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  function loadEmployees() {
-    fetch(`${API}/employees`)
+  function loadEmployees(cl = client) {
+    fetch(`${API}/employees?client=${cl}`)
       .then(r => r.json())
       .then(d => {
         if (d.success) {
           setEmployees(d.data.map(norm));
           setDbError(null);
+        } else {
+          setEmployees([]);
+          setDbError(`Database Error: ${d.error}`);
         }
       })
-      .catch(() => setDbError("Database connection failed. Make sure backend 'node server.js' is running."));
+      .catch(() => {
+        setEmployees([]);
+        setDbError("Database connection failed. Make sure backend 'node server.js' is running.");
+      });
   }
 
-  function loadDaily(dateVal) {
+  function loadDaily(dateVal, cl = client) {
     setLoading(true);
     const target = dateVal || selectedDate;
-    fetch(`${API}/daily?date=${target}`)
+    fetch(`${API}/daily?date=${target}&client=${cl}`)
       .then(r => r.json())
       .then(d => {
         if (d.success) {
           setTodayData(d.data.map(norm));
           setDbError(null);
+        } else {
+          setTodayData([]);
+          setDbError(`Database Error: ${d.error}`);
         }
       })
-      .catch(() => setDbError("Database connection failed. Make sure backend 'node server.js' is running."))
+      .catch(() => {
+        setTodayData([]);
+        setDbError("Database connection failed. Make sure backend 'node server.js' is running.");
+      })
       .finally(() => setLoading(false));
 
-    loadWeekly(target);
+    loadWeekly(target, cl);
   }
 
   function loadToday() {
-    loadDaily(selectedDate);
+    loadDaily(selectedDate, client);
   }
 
-  function loadWeekly(dateVal) {
+  function loadWeekly(dateVal, cl = client) {
     const target = dateVal || selectedDate;
-    fetch(`${API}/weekly?date=${target}`)
+    fetch(`${API}/weekly?date=${target}&client=${cl}`)
       .then(r => r.json())
       .then(d => {
-        if (d.success) setWeeklyData(d.data);
+        if (d.success) {
+          setWeeklyData(d.data);
+        } else {
+          setWeeklyData([]);
+        }
       })
-      .catch(() => {});
+      .catch(() => setWeeklyData([]));
   }
 
-  function loadMonthly(empId, m, y) {
+  function loadMonthly(empId, m, y, cl = client) {
     setLoading(true);
-    fetch(`${API}/attendance/${empId}?month=${m}&year=${y}`)
+    fetch(`${API}/attendance/${empId}?month=${m}&year=${y}&client=${cl}`)
       .then(r => r.json())
       .then(d => {
         if (d.success) setMonthly(d.data.map(norm));
@@ -226,9 +268,9 @@ export default function AttendanceDashboard() {
       .finally(() => setLoading(false));
   }
 
-  function loadPayroll(m, y) {
+  function loadPayroll(m, y, cl = client) {
     setLoading(true);
-    fetch(`${API}/payroll?month=${m}&year=${y}`)
+    fetch(`${API}/payroll?month=${m}&year=${y}&client=${cl}`)
       .then(r => r.json())
       .then(d => {
         if (d.success) setPayrollData(d.data.map(norm));
@@ -307,7 +349,8 @@ export default function AttendanceDashboard() {
       email: profileEmail,
       designation: profileDesignation,
       location: profileLocation,
-      aadhaarNumber: profileAadhaar
+      aadhaarNumber: profileAadhaar,
+      client: client
     };
 
     fetch(`${API}/employee/update-profile`, {
@@ -319,7 +362,7 @@ export default function AttendanceDashboard() {
       .then(d => {
         if (d.success) {
           setProfileSaveMsg({ type: 'success', text: '✅ HR Profile details saved to SQL Database!' });
-          loadEmployees();
+          loadEmployees(client);
           setActiveModal(prev => ({
             ...prev,
             fatherName: profileFatherName,
@@ -348,7 +391,8 @@ export default function AttendanceDashboard() {
       date: activeModal.date || new Date().toISOString().split('T')[0],
       punchIn: formPunchIn,
       punchOut: formPunchOut,
-      isOnLeave: formIsLeave
+      isOnLeave: formIsLeave,
+      client: client
     };
 
     fetch(`${API}/attendance/update`, {
@@ -361,7 +405,7 @@ export default function AttendanceDashboard() {
         if (d.success) {
           setSaveMsg({ type: 'success', text: '✅ Attendance updated in SQL Database!' });
           loadToday();
-          if (selEmp) loadMonthly(selEmp.employeeId, month, year);
+          if (selEmp) loadMonthly(selEmp.employeeId, month, year, client);
           setActiveModal(prev => ({
             ...prev,
             punchIn: formPunchIn,
@@ -399,7 +443,8 @@ export default function AttendanceDashboard() {
       punchIn: (cellStatus === 'absent' || cellStatus === 'leave') ? '' : cellPunchIn,
       punchOut: (cellStatus === 'absent' || cellStatus === 'leave') ? '' : cellPunchOut,
       isOnLeave: cellStatus === 'leave',
-      lateByMinutes: cellStatus === 'late' ? 30 : 0
+      lateByMinutes: cellStatus === 'late' ? 30 : 0,
+      client: client
     };
 
     fetch(`${API}/attendance/update`, {
@@ -411,8 +456,8 @@ export default function AttendanceDashboard() {
       .then(d => {
         if (d.success) {
           setCellSaveMsg({ type: 'success', text: '✅ Attendance & Punch Time updated in SQL DB!' });
-          loadMonthly(activeModal.employeeId, month, year);
-          loadDaily(selectedDate);
+          loadMonthly(activeModal.employeeId, month, year, client);
+          loadDaily(selectedDate, client);
           setTimeout(() => setSelectedDayCell(null), 900);
         } else {
           setCellSaveMsg({ type: 'error', text: `❌ Failed: ${d.error}` });
@@ -450,7 +495,7 @@ export default function AttendanceDashboard() {
   });
 
   const stats = {
-    present:  todayData.filter(r => getStatus(r)==="present").length,
+    present:  todayData.filter(r => getStatus(r)==="present" || getStatus(r)==="in-office").length,
     absent:   todayData.filter(r => getStatus(r)==="absent").length,
     inOffice: todayData.filter(r => getStatus(r)==="in-office").length,
     late:     todayData.filter(r => r.lateByMinutes > 0).length,
@@ -483,6 +528,19 @@ export default function AttendanceDashboard() {
               <div style={{ width:8, height:8, borderRadius:"50%", background:"#22c55e", boxShadow:"0 0 8px #22c55e" }} />
               <h1 style={{ color:"#f8fafc", fontSize:19, fontWeight:800, margin:0, letterSpacing:"-.3px" }}>Mabicons Attendance</h1>
               <span style={{ fontSize:10, background:"#22c55e22", color:"#22c55e", padding:"2px 8px", borderRadius:10, border:"1px solid #22c55e55", fontWeight:600 }}>LIVE DATABASE</span>
+              
+              {/* Sleek Client Selection Dropdown */}
+              <div style={{ display:"flex", alignItems:"center", gap:6, background:"rgba(255,255,255,0.08)", padding:"4px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.12)", marginLeft:12 }}>
+                <span style={{ fontSize:10, fontWeight:700, color:"#94a3b8", textTransform:"uppercase", letterSpacing:"0.4px" }}>Client:</span>
+                <select value={client} onChange={e => handleClientChange(e.target.value)}
+                  style={{ background:"transparent", border:"none", color:"#fff", fontSize:11, fontWeight:800, outline:"none", cursor:"pointer", padding:"2px 4px", fontFamily:"inherit" }}>
+                  {clients.map(c => (
+                    <option key={c.id} value={c.id} style={{ background:"#1e293b", color:"#fff" }}>
+                      {c.name === "MI ROAD" ? "SEPL" : c.name === "VKI LOCATION" ? "Solow Mart" : c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
             <div style={{ color:"#94a3b8", fontSize:13, marginTop:5 }}>
               {new Date().toLocaleDateString("en-IN",{ weekday:"long", day:"numeric", month:"long", year:"numeric" })} • Manager Dashboard
@@ -930,6 +988,7 @@ export default function AttendanceDashboard() {
 
         {/* ══════════════ DAILY ATTENDANCE TAB ══════════════ */}
         {tab==="today" && (<>
+
 
           {/* Search + Filter Control Bar */}
           <div style={{ background:"#fff", borderRadius:14, padding:"14px 18px", border:"1px solid #f1f5f9", marginBottom:20, display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:14, boxShadow:"0 1px 4px rgba(0,0,0,.06)" }}>

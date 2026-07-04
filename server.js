@@ -19,14 +19,45 @@ const dbConfig = {
   },
 };
 
-// DB Connection Pool
-let pool;
-async function getPool() {
-  if (!pool) {
-    pool = await sql.connect(dbConfig);
-  }
-  return pool;
+const clientDbs = {
+  sepl: 'ESSLSEPLMBCN',
+  solow_mart: 'ESSLSEPLMBCN'
+};
+
+function getClient(req) {
+  return req.query.client || req.body.client || 'sepl';
 }
+
+// DB Connection Pool
+const pools = {};
+async function getPool(client = 'sepl') {
+  const cl = String(client).toLowerCase().trim();
+  const dbName = clientDbs[cl] || clientDbs.sepl;
+  if (!pools[dbName]) {
+    const config = { ...dbConfig, database: dbName };
+    pools[dbName] = await sql.connect(config);
+  }
+  return pools[dbName];
+}
+
+// ─────────────────────────────────────────────
+// API 0: Clients List from Devices
+// GET /api/clients
+// ─────────────────────────────────────────────
+app.get('/api/clients', async (req, res) => {
+  try {
+    const db = await getPool(getClient(req));
+    const result = await db.request().query(`
+      SELECT DeviceId AS id, DeviceFName AS name 
+      FROM dbo.Devices 
+      WHERE DeviceType = 'Attendance' AND SerialNumber <> ''
+      ORDER BY DeviceFName
+    `);
+    res.json({ success: true, data: result.recordset });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // ─────────────────────────────────────────────
 // API 1: Sabhi Employees ki list
@@ -34,8 +65,10 @@ async function getPool() {
 // ─────────────────────────────────────────────
 app.get('/api/employees', async (req, res) => {
   try {
-    const db = await getPool();
-    const result = await db.request().query(`
+    const db = await getPool(getClient(req));
+    const deviceId = req.query.client ? parseInt(req.query.client, 10) : null;
+    
+    let query = `
       SELECT 
         EmployeeId, EmployeeName, EmployeeCode, Gender, EmployementType,
         CASE WHEN DOJ IS NULL OR YEAR(DOJ)<=1900 THEN NULL ELSE CONVERT(VARCHAR(10), DOJ, 120) END AS doj,
@@ -45,8 +78,18 @@ app.get('/api/employees', async (req, res) => {
       WHERE RecordStatus = 1 
         AND EmployeeName NOT LIKE 'del_%' 
         AND EmployeeName NOT LIKE 'ADMIN%'
-      ORDER BY EmployeeName
-    `);
+    `;
+    
+    if (deviceId) {
+      query += ` AND DeviceId = @deviceId `;
+    }
+    query += ` ORDER BY EmployeeName `;
+    
+    const request = db.request();
+    if (deviceId) {
+      request.input('deviceId', sql.Int, deviceId);
+    }
+    const result = await request.query(query);
     res.json({ success: true, data: result.recordset });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -63,11 +106,21 @@ app.get('/api/attendance/:employeeId', async (req, res) => {
     const month = req.query.month || new Date().getMonth() + 1;
     const year  = req.query.year  || new Date().getFullYear();
 
-    const db = await getPool();
+    const db = await getPool(getClient(req));
+    const startDate = `${year}-${String(month).padStart(2,'0')}-01`;
+    const endDate   = `${year}-${String(month).padStart(2,'0')}-31`;
+
+    // 1. Get employee code first for raw logs mapping
+    const empRes = await db.request()
+      .input('empId', sql.Int, employeeId)
+      .query('SELECT EmployeeCode FROM dbo.Employees WHERE EmployeeId = @empId');
+    const empCode = empRes.recordset[0]?.EmployeeCode;
+
+    // 2. Fetch standard summarized logs
     const result = await db.request()
       .input('empId', sql.Int, employeeId)
-      .input('startDate', sql.DateTime, `${year}-${String(month).padStart(2,'0')}-01`)
-      .input('endDate',   sql.DateTime, `${year}-${String(month).padStart(2,'0')}-31`)
+      .input('startDate', sql.DateTime, startDate)
+      .input('endDate',   sql.DateTime, endDate)
       .query(`
         SELECT
           CAST(AttendanceDate AS DATE)  AS date,
@@ -88,10 +141,92 @@ app.get('/api/attendance/:employeeId', async (req, res) => {
         WHERE EmployeeId = @empId
           AND AttendanceDate >= @startDate
           AND AttendanceDate <= @endDate
-        ORDER BY AttendanceDate DESC
       `);
 
-    res.json({ success: true, data: result.recordset });
+    const logsMap = {};
+    result.recordset.forEach(r => {
+      if (r.date) {
+        const dateStr = new Date(r.date).toISOString().split('T')[0];
+        logsMap[dateStr] = {
+          date: dateStr,
+          punchIn: r.punchIn,
+          punchOut: r.punchOut,
+          workingMinutes: r.workingMinutes,
+          lateByMinutes: r.lateByMinutes,
+          isOnLeave: r.isOnLeave,
+          LeaveType: r.LeaveType,
+          PunchRecords: r.PunchRecords
+        };
+      }
+    });
+
+    // 3. Fallback to query raw partition device logs table
+    if (empCode) {
+      try {
+        const deviceLogsTable = `dbo.DeviceLogs_${parseInt(month, 10)}_${parseInt(year, 10)}`;
+        const rawRes = await db.request()
+          .input('empCode', sql.VarChar, empCode)
+          .input('startDate', sql.DateTime, startDate)
+          .input('endDate',   sql.DateTime, endDate)
+          .query(`
+            SELECT LogDate 
+            FROM ${deviceLogsTable}
+            WHERE UserId = @empCode
+              AND LogDate >= @startDate
+              AND LogDate <= @endDate
+            ORDER BY LogDate
+          `);
+
+        const rawMap = {};
+        rawRes.recordset.forEach(row => {
+          if (row.LogDate) {
+            const dStr = new Date(row.LogDate).toISOString().split('T')[0];
+            if (!rawMap[dStr]) rawMap[dStr] = [];
+            rawMap[dStr].push(new Date(row.LogDate));
+          }
+        });
+
+        Object.keys(rawMap).forEach(dStr => {
+          const punches = rawMap[dStr];
+          const minLog = punches[0];
+          const maxLog = punches[punches.length - 1];
+
+          const formatTime = (dateObj) => {
+            return dateObj.toTimeString().split(' ')[0].substring(0, 5);
+          };
+
+          const minStr = formatTime(minLog);
+          const maxStr = maxLog.getTime() !== minLog.getTime() ? formatTime(maxLog) : null;
+          const diffMin = maxStr ? Math.round((maxLog.getTime() - minLog.getTime()) / 60000) : 0;
+
+          if (logsMap[dStr]) {
+            const entry = logsMap[dStr];
+            if (!entry.punchIn) entry.punchIn = minStr;
+            if (!entry.punchOut && maxStr) entry.punchOut = maxStr;
+            if (!entry.workingMinutes && diffMin > 0) entry.workingMinutes = diffMin;
+            if (!entry.PunchRecords) {
+              entry.PunchRecords = maxStr ? `In: ${minStr}, Out: ${maxStr}` : `In: ${minStr}`;
+            }
+          } else {
+            logsMap[dStr] = {
+              date: dStr,
+              punchIn: minStr,
+              punchOut: maxStr,
+              workingMinutes: diffMin,
+              lateByMinutes: 0,
+              isOnLeave: 0,
+              LeaveType: null,
+              PunchRecords: maxStr ? `In: ${minStr}, Out: ${maxStr}` : `In: ${minStr}`
+            };
+          }
+        });
+      } catch (e) {
+        // Partition table might not exist yet, safe to ignore
+      }
+    }
+
+    const finalLogs = Object.values(logsMap).sort((a, b) => b.date.localeCompare(a.date));
+    res.json({ success: true, data: finalLogs });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -103,11 +238,91 @@ app.get('/api/attendance/:employeeId', async (req, res) => {
 // ─────────────────────────────────────────────
 app.get(['/api/daily', '/api/today'], async (req, res) => {
   try {
-    const db = await getPool();
+    const db = await getPool(getClient(req));
     const targetDate = req.query.date || new Date().toISOString().split('T')[0];
-    const result = await db.request()
-      .input('targetDate', sql.DateTime, targetDate)
-      .query(`
+    const deviceId = req.query.client ? parseInt(req.query.client, 10) : null;
+    let result;
+    try {
+      const parts = targetDate.split('-');
+      const month = parseInt(parts[1], 10);
+      const year = parseInt(parts[0], 10);
+      const deviceLogsTable = `dbo.DeviceLogs_${month}_${year}`;
+      
+      let query = `
+        SELECT
+          e.EmployeeId,
+          e.EmployeeName,
+          e.EmployeeCode,
+          e.Gender,
+          e.EmployementType,
+          CASE WHEN e.DOJ IS NULL OR YEAR(e.DOJ)<=1900 THEN NULL ELSE CONVERT(VARCHAR(10), e.DOJ, 120) END AS doj,
+          CASE WHEN e.DOB IS NULL OR YEAR(e.DOB)<=1900 THEN NULL ELSE CONVERT(VARCHAR(10), e.DOB, 120) END AS dob,
+          e.FatherName,
+          e.ContactNo,
+          e.Email,
+          e.Designation,
+          e.Location,
+          e.AadhaarNumber,
+          e.EmployeeRFIDNumber,
+          COALESCE(
+            CASE 
+              WHEN a.InTime IS NULL OR CAST(a.InTime AS VARCHAR) LIKE '1900%' OR SUBSTRING(CONVERT(VARCHAR(19), a.InTime, 120), 12, 5) = '00:00' THEN NULL 
+              ELSE SUBSTRING(CONVERT(VARCHAR(19), a.InTime, 120), 12, 5) 
+            END,
+            SUBSTRING(CONVERT(VARCHAR(19), r.MinLog, 120), 12, 5)
+          ) AS punchIn,
+          COALESCE(
+            CASE 
+              WHEN a.OutTime IS NULL OR CAST(a.OutTime AS VARCHAR) LIKE '1900%' OR SUBSTRING(CONVERT(VARCHAR(19), a.OutTime, 120), 12, 5) = '00:00' THEN NULL 
+              ELSE SUBSTRING(CONVERT(VARCHAR(19), a.OutTime, 120), 12, 5) 
+            END,
+            CASE WHEN r.MaxLog = r.MinLog THEN NULL ELSE SUBSTRING(CONVERT(VARCHAR(19), r.MaxLog, 120), 12, 5) END
+          ) AS punchOut,
+          CASE 
+            WHEN ISNULL(a.Duration, 0) > 0 THEN a.Duration
+            WHEN r.MinLog IS NOT NULL AND r.MaxLog IS NOT NULL AND r.MaxLog > r.MinLog THEN DATEDIFF(minute, r.MinLog, r.MaxLog)
+            ELSE 0
+          END AS workingMinutes,
+          ISNULL(a.LateBy, 0)      AS lateByMinutes,
+          ISNULL(a.IsOnLeave, 0)   AS isOnLeave,
+          COALESCE(
+            a.PunchRecords,
+            CASE 
+              WHEN r.MinLog IS NOT NULL AND r.MaxLog IS NOT NULL AND r.MaxLog > r.MinLog 
+                THEN 'In: ' + SUBSTRING(CONVERT(VARCHAR(19), r.MinLog, 120), 12, 5) + ', Out: ' + SUBSTRING(CONVERT(VARCHAR(19), r.MaxLog, 120), 12, 5)
+              WHEN r.MinLog IS NOT NULL 
+                THEN 'In: ' + SUBSTRING(CONVERT(VARCHAR(19), r.MinLog, 120), 12, 5)
+              ELSE NULL 
+            END
+          ) AS PunchRecords
+        FROM dbo.Employees e
+        LEFT JOIN dbo.AttendanceLogs a ON e.EmployeeId = a.EmployeeId AND CAST(a.AttendanceDate AS DATE) = @targetDate
+        LEFT JOIN (
+          SELECT 
+            UserId,
+            MIN(LogDate) AS MinLog,
+            MAX(LogDate) AS MaxLog
+          FROM ${deviceLogsTable}
+          WHERE CAST(LogDate AS DATE) = @targetDate
+          GROUP BY UserId
+        ) r ON e.EmployeeCode = r.UserId
+        WHERE e.RecordStatus = 1 
+          AND e.EmployeeName NOT LIKE 'del_%' 
+          AND e.EmployeeName NOT LIKE 'ADMIN%'
+      `;
+      
+      if (deviceId) {
+        query += ` AND e.DeviceId = @deviceId `;
+      }
+      query += ` ORDER BY e.EmployeeName `;
+
+      const request = db.request().input('targetDate', sql.DateTime, targetDate);
+      if (deviceId) {
+        request.input('deviceId', sql.Int, deviceId);
+      }
+      result = await request.query(query);
+    } catch (dbErr) {
+      let query = `
         SELECT
           e.EmployeeId,
           e.EmployeeName,
@@ -140,8 +355,18 @@ app.get(['/api/daily', '/api/today'], async (req, res) => {
         WHERE e.RecordStatus = 1 
           AND e.EmployeeName NOT LIKE 'del_%' 
           AND e.EmployeeName NOT LIKE 'ADMIN%'
-        ORDER BY e.EmployeeName
-      `);
+      `;
+      if (deviceId) {
+        query += ` AND e.DeviceId = @deviceId `;
+      }
+      query += ` ORDER BY e.EmployeeName `;
+
+      const request = db.request().input('targetDate', sql.DateTime, targetDate);
+      if (deviceId) {
+        request.input('deviceId', sql.Int, deviceId);
+      }
+      result = await request.query(query);
+    }
 
     res.json({ success: true, data: result.recordset });
   } catch (err) {
@@ -155,7 +380,7 @@ app.get(['/api/daily', '/api/today'], async (req, res) => {
 // ─────────────────────────────────────────────
 app.get('/api/weekly', async (req, res) => {
   try {
-    const db = await getPool();
+    const db = await getPool(getClient(req));
     const targetDate = req.query.date || new Date().toISOString().split('T')[0];
     const result = await db.request()
       .input('refDate', sql.DateTime, targetDate)
@@ -185,7 +410,7 @@ app.get('/api/weekly', async (req, res) => {
 app.post('/api/attendance/update', async (req, res) => {
   try {
     const { employeeId, date, punchIn, punchOut, isOnLeave } = req.body;
-    const db = await getPool();
+    const db = await getPool(getClient(req));
 
     const targetDate = date || new Date().toISOString().split('T')[0];
     const inTimeVal  = punchIn  ? `${targetDate} ${punchIn}:00`  : null;
@@ -237,7 +462,7 @@ app.post('/api/attendance/update', async (req, res) => {
 app.post('/api/employee/update-profile', async (req, res) => {
   try {
     const { employeeId, fatherName, contactNo, email, designation, location, aadhaarNumber } = req.body;
-    const db = await getPool();
+    const db = await getPool(getClient(req));
 
     await db.request()
       .input('empId', sql.Int, employeeId)
@@ -272,36 +497,50 @@ app.get('/api/payroll', async (req, res) => {
   try {
     const month = req.query.month || new Date().getMonth() + 1;
     const year  = req.query.year  || new Date().getFullYear();
+    const deviceId = req.query.client ? parseInt(req.query.client, 10) : null;
 
-    const db = await getPool();
+    const db = await getPool(getClient(req));
     const startDate = `${year}-${String(month).padStart(2,'0')}-01`;
     const endDate   = `${year}-${String(month).padStart(2,'0')}-31`;
 
-    const result = await db.request()
-      .input('startDate', sql.DateTime, startDate)
-      .input('endDate',   sql.DateTime, endDate)
-      .query(`
-        SELECT 
-          e.EmployeeId,
-          e.EmployeeName,
-          e.EmployeeCode,
-          COUNT(CASE WHEN a.InTime IS NOT NULL AND a.IsOnLeave = 0 THEN 1 END) AS presentDays,
-          COUNT(CASE WHEN a.IsOnLeave = 1 THEN 1 END) AS leaveDays,
-          COUNT(CASE WHEN a.LateBy > 0 THEN 1 END) AS lateDays,
-          ISNULL(SUM(a.Duration), 0) AS totalWorkingMinutes,
-          ISNULL(SUM(CASE WHEN a.Duration > 480 THEN (a.Duration - 480) ELSE 0 END), 0) AS totalOvertimeMinutes
-        FROM dbo.Employees e
-        LEFT JOIN dbo.AttendanceLogs a 
-          ON e.EmployeeId = a.EmployeeId 
-          AND a.AttendanceDate >= @startDate 
-          AND a.AttendanceDate <= @endDate
-        WHERE e.RecordStatus = 1 
-          AND e.EmployeeName NOT LIKE 'del_%' 
-          AND e.EmployeeName NOT LIKE 'ADMIN%'
-        GROUP BY e.EmployeeId, e.EmployeeName, e.EmployeeCode
-        ORDER BY e.EmployeeName
-      `);
+    let query = `
+      SELECT 
+        e.EmployeeId,
+        e.EmployeeName,
+        e.EmployeeCode,
+        COUNT(CASE WHEN a.InTime IS NOT NULL AND a.IsOnLeave = 0 THEN 1 END) AS presentDays,
+        COUNT(CASE WHEN a.IsOnLeave = 1 THEN 1 END) AS leaveDays,
+        COUNT(CASE WHEN a.LateBy > 0 THEN 1 END) AS lateDays,
+        ISNULL(SUM(a.Duration), 0) AS totalWorkingMinutes,
+        ISNULL(SUM(CASE WHEN a.Duration > 480 THEN (a.Duration - 480) ELSE 0 END), 0) AS totalOvertimeMinutes
+      FROM dbo.Employees e
+      LEFT JOIN dbo.AttendanceLogs a 
+        ON e.EmployeeId = a.EmployeeId 
+        AND a.AttendanceDate >= @startDate 
+        AND a.AttendanceDate <= @endDate
+      WHERE e.RecordStatus = 1 
+        AND e.EmployeeName NOT LIKE 'del_%' 
+        AND e.EmployeeName NOT LIKE 'ADMIN%'
+    `;
+    
+    if (deviceId) {
+      query += ` AND e.DeviceId = @deviceId `;
+    }
+    
+    query += `
+      GROUP BY e.EmployeeId, e.EmployeeName, e.EmployeeCode
+      ORDER BY e.EmployeeName
+    `;
 
+    const request = db.request()
+      .input('startDate', sql.DateTime, startDate)
+      .input('endDate',   sql.DateTime, endDate);
+      
+    if (deviceId) {
+      request.input('deviceId', sql.Int, deviceId);
+    }
+
+    const result = await request.query(query);
     res.json({ success: true, data: result.recordset });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
