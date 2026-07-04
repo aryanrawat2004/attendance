@@ -30,13 +30,26 @@ function getClient(req) {
 
 // DB Connection Pool
 const pools = {};
-async function getPool(client = 'sepl') {
+async function getPool(client = "sepl") {
   const cl = String(client).toLowerCase().trim();
   const dbName = clientDbs[cl] || clientDbs.sepl;
+
   if (!pools[dbName]) {
-    const config = { ...dbConfig, database: dbName };
-    pools[dbName] = await sql.connect(config);
+    try {
+      const config = { ...dbConfig, database: dbName };
+
+      console.log("Connecting to SQL...");
+      console.log(config);
+
+      pools[dbName] = await sql.connect(config);
+
+      console.log("SQL Connected Successfully");
+    } catch (err) {
+      console.error("FULL SQL ERROR:", err);
+      throw err;
+    }
   }
+
   return pools[dbName];
 }
 
